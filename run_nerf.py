@@ -422,7 +422,7 @@ def config_parser():
 
     import configargparse
     parser = configargparse.ArgumentParser()
-    parser.add_argument('--config', is_config_file=True, default='configs/ship.txt',
+    parser.add_argument('--config', is_config_file=True, default='configs/bop/linemod_cat.txt',
                         help='config file path')
     parser.add_argument("--expname", type=str, 
                         help='experiment name')
@@ -515,12 +515,16 @@ def config_parser():
                         help='set for spherical 360 scenes')
     parser.add_argument("--llffhold", type=int, default=8, 
                         help='will take every 1/N images as LLFF test set, paper uses 8')
+    
+    # bop linemod config
+    parser.add_argument('--obj', type=str, default='000001',
+                        help='the obj id for bop')
+    parser.add_argument('--normalize_factor', type=float, default=1.,
+                        help='normalize the translation for bop with actual size')
 
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_img",     type=int, default=500, 
-                        help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000, 
@@ -608,12 +612,21 @@ def train():
         far = hemi_R+1.
 
     elif args.dataset_type == 'bop':
-        images, poses, render_poses, K, i_split = load_bop_linemod_data(
+        images, poses, render_poses, hwK, i_split = load_bop_linemod_data(
             args.datadir, args.half_res, args.obj, args.normalize_factor)
-        
-        hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
+        i_train, i_val, i_test = i_split
+        H, W, K = hwK
+
+        hemi_R = np.linalg.norm(poses[:,:3,-1], axis=-1)
+        near = hemi_R.min() * 0.9
+        far = hemi_R.max() * 1.
+
+        if args.white_bkgd:
+            # images is four channel, while the last channel is the alpha 
+            # convert to RGB
+            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+        else:
+            images = images[...,:3]
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -841,47 +854,45 @@ def train():
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
 
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+            # print('iter time {:.05f}'.format(dt))
 
-
-            if i%args.i_img==0:
-
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
-
-                psnr = mse2psnr(img2mse(rgb, target))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+            # with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
+            #     tf.contrib.summary.scalar('loss', loss)
+            #     tf.contrib.summary.scalar('psnr', psnr)
+            #     tf.contrib.summary.histogram('tran', trans)
+            #     if args.N_importance > 0:
+            #         tf.contrib.summary.scalar('psnr0', psnr0)
 
 
-                if args.N_importance > 0:
+            # if i%args.i_img==0:
 
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
+            #     # Log a rendered validation view to Tensorboard
+            #     img_i=np.random.choice(i_val)
+            #     target = images[img_i]
+            #     pose = poses[img_i, :3,:4]
+            #     with torch.no_grad():
+            #         rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+            #                                             **render_kwargs_test)
+
+            #     psnr = mse2psnr(img2mse(rgb, target))
+
+            #     with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+
+            #         tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
+            #         tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
+            #         tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
+
+            #         tf.contrib.summary.scalar('psnr_holdout', psnr)
+            #         tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+
+
+            #     if args.N_importance > 0:
+
+            #         with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+            #             tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
+            #             tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
+            #             tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
 
         global_step += 1
 

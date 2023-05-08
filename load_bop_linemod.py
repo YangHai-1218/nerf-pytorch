@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import imageio 
 import cv2
+from tqdm import tqdm
 
 
 trans_t = lambda t : torch.Tensor([
@@ -42,40 +43,42 @@ def load_bop_linemod_data(basedir, half_res=False, obj='000001', normalize_facto
         all_TCO = []
         for image_id in annotations:
             RCO = np.array(annotations[image_id][0]['cam_R_m2c'], dtype=np.float32).reshape(3,3)
-            tCO = np.array(annotations[image_id][0]['cam_t_m2c'], dtype=np.float32).t()
-            TCO = np.zeros((4, 4), dtype=np.float32) / normalize_factor
+            tCO = np.array(annotations[image_id][0]['cam_t_m2c'], dtype=np.float32).T / normalize_factor
+            TCO = np.zeros((4, 4), dtype=np.float32)
             TCO[:3,:3] = RCO
             TCO[:3, -1] = tCO
             TCO[-1, -1] = 1. 
-            all_TCO.apped(TCO)
+            all_TCO.append(TCO)
     
     # load images and image lists
     splits = ['train', 'val', 'test']
     image_lists = {}
     all_images = []
     for s in splits:
-        with open(os.path.join(basedir, 'nerf_image_lists', obj+'_'+s+'.txt'), 'r') as f:
+        with open(osp.join(osp.dirname(basedir), 'nerf_image_lists', obj+'_'+s+'.txt'), 'r') as f:
             image_lists[s] = list(map(lambda x:x.strip(), f.readlines()))
-        for image_path in image_lists[s]:
+        pbar = tqdm(image_lists[s])
+        for image_path in pbar:
             image = imageio.imread(osp.join(basedir, obj, 'rgb', image_path)) #RGB
-            mask = cv2.imread(osp.join(basedir, 'mask_visib', image_path.split('.')[0]+'_000000.png'))
-            image = (np.array(image) / 255).astype(np.float32)
-            image = np.concatenate([image, (mask/255).astype(np.float32)], axis=0) # RGBA
+            mask = imageio.imread(osp.join(basedir, obj, 'mask_visib', image_path.split('.')[0]+'_000000.png'))
+            image = (image / 255).astype(np.float32)
+            mask = (mask / 255).astype(np.float32)
+            image = np.concatenate([image, mask[..., None]], axis=-1) # RGBA
             all_images.append(image)
     
     all_images = np.stack(all_images, axis=0)
     all_TCO = np.stack(all_TCO, axis=0)
-    all_TOC = np.linalg.inv(all_TCO) # object pose -> camera pose
     
     # reformat poses
-    new_TOC, i_split = [], []
+    new_TCO, i_split = [], []
     count = 0
     for s in image_lists:
         image_index = np.array(list(map(lambda x:int(x.split('.')[0]), image_lists[s])), dtype=np.int64)
-        new_TOC.append(all_TOC[image_index])
+        new_TCO.append(all_TCO[image_index])
         i_split.append(np.arange(count, count+len(image_index)))
         count += len(image_index)
-    all_TOC = np.concatenate(new_TOC, axis=0)
+    all_TCO = np.concatenate(new_TCO, axis=0)
+    all_TOC = np.linalg.inv(all_TCO) # object pose -> camera pose
 
     camera_k = np.array([[572.4114, 0.0, 325.2611, 0.0, 573.57043, 242.04899, 0.0, 0.0, 1.0]], dtype=np.float32).reshape(3, 3)
     H, W = 480, 640
@@ -90,4 +93,4 @@ def load_bop_linemod_data(basedir, half_res=False, obj='000001', normalize_facto
             images_half_res[i] = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
         all_images = images_half_res
         
-    return all_images, all_TOC, render_poses, camera_k, i_split
+    return all_images, all_TOC, render_poses, (H, W, camera_k), i_split
