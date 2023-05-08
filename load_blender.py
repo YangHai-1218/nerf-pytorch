@@ -87,5 +87,3 @@ def load_blender_data(basedir, half_res=False, testskip=1):
 
         
     return imgs, poses, render_poses, [H, W, focal], i_split
-
-

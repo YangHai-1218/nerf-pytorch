@@ -1,0 +1,22 @@
+expname = linemod_cat
+basedir = ./logs/linemod
+datadir = ./data/lm/test
+dataset_type = bop
+obj = 000006
+normalize_factor = 100.
+
+no_batching = True
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
+

@@ -1,8 +1,6 @@
-import os, sys
+import os
 import numpy as np
 import imageio
-import json
-import random
 import time
 import torch
 import torch.nn as nn
@@ -17,6 +15,7 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
+from load_bop_linemod import load_bop_linemod_data
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -350,13 +349,14 @@ def render_rays(ray_batch,
     """
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    # viewdirs is driven from rays_d
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
-        z_vals = near * (1.-t_vals) + far * (t_vals)
+        z_vals = near * (1.-t_vals) + far * (t_vals) # near + (far - near) * t_vals
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
@@ -422,13 +422,13 @@ def config_parser():
 
     import configargparse
     parser = configargparse.ArgumentParser()
-    parser.add_argument('--config', is_config_file=True, 
+    parser.add_argument('--config', is_config_file=True, default='configs/ship.txt',
                         help='config file path')
     parser.add_argument("--expname", type=str, 
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
+    parser.add_argument("--datadir", type=str, default='./data/ship', 
                         help='input data directory')
 
     # training options
@@ -567,6 +567,8 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
+        # poses and render_poses are camera -> world
+        # poses consist of training, validating, and testing poses, while render_poses are created manually
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
@@ -586,6 +588,8 @@ def train():
         i_train, i_val, i_test = i_split
 
         if args.white_bkgd:
+            # images is four channel, while the last channel is the alpha 
+            # convert to RGB
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
             images = images[...,:3]
@@ -603,21 +607,31 @@ def train():
         near = hemi_R-1.
         far = hemi_R+1.
 
+    elif args.dataset_type == 'bop':
+        images, poses, render_poses, K, i_split = load_bop_linemod_data(
+            args.datadir, args.half_res, args.obj, args.normalize_factor)
+        
+        hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
+        near = hemi_R-1.
+        far = hemi_R+1.
+
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
 
-    # Cast intrinsics to right types
-    H, W, focal = hwf
-    H, W = int(H), int(W)
-    hwf = [H, W, focal]
 
     if K is None:
+        # Cast intrinsics to right types
+        H, W, focal = hwf
+        H, W = int(H), int(W)
+        hwf = [H, W, focal]
+
         K = np.array([
             [focal, 0, 0.5*W],
             [0, focal, 0.5*H],
             [0, 0, 1]
         ])
+
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
@@ -753,7 +767,7 @@ def train():
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
+                batch_rays = torch.stack([rays_o, rays_d], 0) # (rays_o, rays_d)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
