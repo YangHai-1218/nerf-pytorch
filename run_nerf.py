@@ -133,22 +133,20 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hw, K, chunk, render_kwargs, masks=None, gt_imgs=None, savedir=None, render_factor=0):
 
-    H, W, focal = hwf
+    H, W = hw
 
     if render_factor!=0:
         # Render downsampled for speed
         H = H//render_factor
         W = W//render_factor
-        focal = focal/render_factor
 
     rgbs = []
     disps = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
-        print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
@@ -164,6 +162,8 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
+            if masks is not None:
+                rgb8[(1 - masks[i]).astype(np.bool_)] = 255
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
 
@@ -622,9 +622,9 @@ def train():
         far = hemi_R.max() * 1.
 
         if args.white_bkgd:
-            # images is four channel, while the last channel is the alpha 
-            # convert to RGB
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+            # images is four channel, while the last channel is the alpha
+            masks = images[..., -1]
+            images = images[...,:3] * masks[..., None] + (1.- masks[..., None])
         else:
             images = images[...,:3]
 
@@ -637,13 +637,16 @@ def train():
         # Cast intrinsics to right types
         H, W, focal = hwf
         H, W = int(H), int(W)
-        hwf = [H, W, focal]
+        hw = [H, W]
 
         K = np.array([
             [focal, 0, 0.5*W],
             [0, focal, 0.5*H],
             [0, 0, 1]
         ])
+    else:
+        hw = [H, W]
+
 
 
     if args.render_test:
@@ -692,7 +695,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _ = render_path(render_poses, hw, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -756,6 +759,7 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
+            mask = torch.Tensor(masks[img_i]).to(torch.int64)
             target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
 
@@ -775,8 +779,10 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                # coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                coords = torch.nonzero(mask)
+                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=True)  # (N_rand,)
+                # select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
@@ -811,10 +817,6 @@ def train():
             param_group['lr'] = new_lrate
         ################################
 
-        dt = time.time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
-        #####           end            #####
-
         # Rest is logging
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
@@ -829,70 +831,23 @@ def train():
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                rgbs, disps = render_path(render_poses, hw, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
-            # if args.use_viewdirs:
-            #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
-            #     with torch.no_grad():
-            #         rgbs_still, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
-            #     render_kwargs_test['c2w_staticcam'] = None
-            #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
-
         if i%args.i_testset==0 and i > 0:
+            split = i_test
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[i_test].shape)
+            print('test poses shape', poses[split].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(torch.Tensor(poses[split]).to(device), hw, K, args.chunk, render_kwargs_test, masks=masks[split], gt_imgs=images[split], savedir=testsavedir)
             print('Saved test set')
 
-
-    
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-
-            # print('iter time {:.05f}'.format(dt))
-
-            # with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-            #     tf.contrib.summary.scalar('loss', loss)
-            #     tf.contrib.summary.scalar('psnr', psnr)
-            #     tf.contrib.summary.histogram('tran', trans)
-            #     if args.N_importance > 0:
-            #         tf.contrib.summary.scalar('psnr0', psnr0)
-
-
-            # if i%args.i_img==0:
-
-            #     # Log a rendered validation view to Tensorboard
-            #     img_i=np.random.choice(i_val)
-            #     target = images[img_i]
-            #     pose = poses[img_i, :3,:4]
-            #     with torch.no_grad():
-            #         rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-            #                                             **render_kwargs_test)
-
-            #     psnr = mse2psnr(img2mse(rgb, target))
-
-            #     with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-            #         tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-            #         tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-            #         tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-            #         tf.contrib.summary.scalar('psnr_holdout', psnr)
-            #         tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-            #     if args.N_importance > 0:
-
-            #         with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-            #             tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-            #             tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-            #             tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
 
         global_step += 1
 

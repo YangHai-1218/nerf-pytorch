@@ -1,4 +1,4 @@
-expname = linemod_cat
+expname = linemod_cat_onlyfg_origres
 basedir = ./logs/linemod
 datadir = ./data/lm/test
 dataset_type = bop
@@ -18,5 +18,5 @@ N_rand = 1024
 precrop_iters = 500
 precrop_frac = 0.5
 
-half_res = True
+half_res = False
 
