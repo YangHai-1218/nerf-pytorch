@@ -1,9 +1,9 @@
-expname = linemod_cat_onlyfg_origres
+expname = linemod_cat_crop_scale1k
 basedir = ./logs/linemod
 datadir = ./data/lm/test
 dataset_type = bop
 obj = 000006
-normalize_factor = 100.
+normalize_factor = 1000.
 
 no_batching = True
 
@@ -20,3 +20,4 @@ precrop_frac = 0.5
 
 half_res = False
 
+crop = True

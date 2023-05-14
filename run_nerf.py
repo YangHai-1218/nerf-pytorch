@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 
+from torch.utils.tensorboard import SummaryWriter
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
@@ -148,7 +149,7 @@ def render_path(render_poses, hw, K, chunk, render_kwargs, masks=None, gt_imgs=N
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, _ = render(H, W, K[i], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
@@ -521,6 +522,8 @@ def config_parser():
                         help='the obj id for bop')
     parser.add_argument('--normalize_factor', type=float, default=1.,
                         help='normalize the translation for bop with actual size')
+    parser.add_argument('--crop', action='store_true', 
+                        help='crop the object')
 
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, 
@@ -613,13 +616,15 @@ def train():
 
     elif args.dataset_type == 'bop':
         images, poses, render_poses, hwK, i_split = load_bop_linemod_data(
-            args.datadir, args.half_res, args.obj, args.normalize_factor)
+            args.datadir, args.half_res, args.obj, args.normalize_factor, args.crop)
         i_train, i_val, i_test = i_split
         H, W, K = hwK
 
-        hemi_R = np.linalg.norm(poses[:,:3,-1], axis=-1)
-        near = hemi_R.min() * 0.9
-        far = hemi_R.max() * 1.
+        near = 5
+        far = 12
+        # hemi_R = np.linalg.norm(poses[:,:3,-1], axis=-1)
+        # near = hemi_R.min() * 0.9
+        # far = hemi_R.max() * 1.
 
         if args.white_bkgd:
             # images is four channel, while the last channel is the alpha
@@ -631,6 +636,7 @@ def train():
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
+
 
 
     if K is None:
@@ -647,10 +653,6 @@ def train():
     else:
         hw = [H, W]
 
-
-
-    if args.render_test:
-        render_poses = np.array(poses[i_test])
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -677,25 +679,25 @@ def train():
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
-    # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).to(device)
-
     # Short circuit if only rendering out from trained model
     if args.render_only:
         print('RENDER ONLY')
         with torch.no_grad():
+            split = i_train
             if args.render_test:
                 # render_test switches to test poses
-                images = images[i_test]
+                images = images[split]
+                render_poses = torch.Tensor(poses[split]).to(device)
             else:
                 # Default is smoother render_poses path
                 images = None
+                render_poses = torch.Tensor(render_poses).to(device)
 
             testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hw, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _ = render_path(render_poses, hw, K[split], args.chunk, render_kwargs_test, gt_imgs=images, masks=masks[split],savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -726,6 +728,7 @@ def train():
     poses = torch.Tensor(poses).to(device)
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
+    render_poses = torch.Tensor(render_poses).to(device)
 
 
     N_iters = 200000 + 1
@@ -735,7 +738,7 @@ def train():
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
+    writer = SummaryWriter(log_dir=os.path.join(basedir, expname, 'tensorboard_log'))
     
     start = start + 1
     for i in trange(start, N_iters):
@@ -764,7 +767,7 @@ def train():
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                rays_o, rays_d = get_rays(H, W, K[img_i], torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
@@ -779,10 +782,11 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
-                # coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                coords = torch.nonzero(mask)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=True)  # (N_rand,)
-                # select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                # only sample foreground rays
+                # coords = torch.nonzero(mask)
+                # select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=True)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
@@ -828,26 +832,28 @@ def train():
             }, path)
             print('Saved checkpoints at', path)
 
-        if i%args.i_video==0 and i > 0:
-            # Turn on testing mode
-            with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hw, K, args.chunk, render_kwargs_test)
-            print('Done, saving', rgbs.shape, disps.shape)
-            moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+        # if i%args.i_video==0 and i > 0:
+        #     # Turn on testing mode
+        #     with torch.no_grad():
+        #         rgbs, disps = render_path(render_poses, hw, K, args.chunk, render_kwargs_test)
+        #     print('Done, saving', rgbs.shape, disps.shape)
+        #     moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+        #     imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+        #     imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
         if i%args.i_testset==0 and i > 0:
-            split = i_test
+            split = i_train
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[split].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[split]).to(device), hw, K, args.chunk, render_kwargs_test, masks=masks[split], gt_imgs=images[split], savedir=testsavedir)
+                render_path(torch.Tensor(poses[split]).to(device), hw, K[split], args.chunk, render_kwargs_test, masks=masks[split], gt_imgs=images[split], savedir=testsavedir)
             print('Saved test set')
 
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            # tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            writer.add_scalar('Loss', loss.item(), i)
+            writer.add_scalar('PSNR', psnr.item(), i)
 
         global_step += 1
 
